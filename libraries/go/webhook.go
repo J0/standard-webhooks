@@ -1,9 +1,11 @@
 package standardwebhooks
 
 import (
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+
 	"errors"
 	"fmt"
 	"net/http"
@@ -12,12 +14,24 @@ import (
 	"time"
 )
 
+type WebhookMethod string
+type KeyType string
+type AsymmetricKeyType string
+type SigningMethod string
+
 const (
 	HeaderWebhookID        string = "webhook-id"
 	HeaderWebhookSignature string = "webhook-signature"
 	HeaderWebhookTimestamp string = "webhook-timestamp"
 
-	webhookSecretPrefix string = "whsec_"
+	webhookSecretPrefix     string        = "whsec_"
+	webhookPublicKeyPrefix  string        = "whpk_"
+	webhookPrivateKeyPrefix string        = "whsk_"
+	secretKeyType           KeyType       = "secret"
+	publicKeyType           KeyType       = "public"
+	privateKeyType          KeyType       = "private"
+	HMAC                    WebhookMethod = "hmac"
+	ED25519                 WebhookMethod = "ed25519"
 )
 
 var base64enc = base64.StdEncoding
@@ -33,7 +47,18 @@ var (
 )
 
 type Webhook struct {
-	key []byte
+	key     []byte
+	method  WebhookMethod
+	options *WebhookOptions
+}
+
+type WebhookOptions struct {
+	keyObject KeyObject
+}
+
+type KeyObject struct {
+	keyObjectType KeyType
+	key           []byte
 }
 
 func NewWebhook(secret string) (*Webhook, error) {
@@ -41,14 +66,26 @@ func NewWebhook(secret string) (*Webhook, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to create webhook, err: %w", err)
 	}
-	return &Webhook{
-		key: key,
-	}, nil
+	return NewWebhookWithOptions(HMAC, &WebhookOptions{
+		KeyObject{
+			keyObjectType: "secret",
+			key:           key,
+		},
+	})
 }
 
 func NewWebhookRaw(secret []byte) (*Webhook, error) {
 	return &Webhook{
 		key: secret,
+	}, nil
+}
+
+func NewWebhookWithOptions(method WebhookMethod, options *WebhookOptions) (*Webhook, error) {
+	return &Webhook{
+		// TODO: Check that the keyObject indeed exists, else return an error
+		key:     options.keyObject.key,
+		method:  method,
+		options: options,
 	}, nil
 }
 
@@ -92,28 +129,42 @@ func (wh *Webhook) verify(payload []byte, headers http.Header, enforceTolerance 
 		}
 	}
 
-	_, expectedSignature, err := wh.sign(msgId, timestamp, payload)
-	if err != nil {
-		return fmt.Errorf("unable to verify payload, err: %w", err)
-	}
-
 	passedSignatures := strings.Split(msgSignature, " ")
+
 	for _, versionedSignature := range passedSignatures {
 		sigParts := strings.Split(versionedSignature, ",")
 		if len(sigParts) < 2 {
 			continue
 		}
-
 		version := sigParts[0]
-
 		if version != "v1" {
 			continue
 		}
-
 		signature := []byte(sigParts[1])
+		switch version {
+		case "v1":
+			if wh.method != HMAC {
+				continue
+			}
 
-		if hmac.Equal(signature, expectedSignature) {
-			return nil
+			_, expectedSignature, err := wh.sign(msgId, timestamp, payload)
+			if err != nil {
+				return fmt.Errorf("unable to verify payload, err: %w", err)
+			}
+
+			if hmac.Equal(signature, expectedSignature) {
+				return nil
+			}
+		case "v1a": // Ed25519 verification
+			if wh.method != ED25519 || wh.options == nil || wh.options.keyObject.keyObjectType != "public" {
+				continue
+			}
+			toSign := fmt.Sprintf("%s.%d.%s", msgId, timestamp.Unix(), string(payload))
+
+			pubKey := ed25519.PublicKey(wh.options.keyObject.key)
+			if ed25519.Verify(pubKey, []byte(toSign), signature) {
+				return nil
+			}
 		}
 	}
 
@@ -125,17 +176,6 @@ func (wh *Webhook) Sign(msgId string, timestamp time.Time, payload []byte) (stri
 	return fmt.Sprintf("%s,%s", version, signature), err
 }
 
-func (wh *Webhook) sign(msgId string, timestamp time.Time, payload []byte) (version string, signature []byte, err error) {
-	toSign := fmt.Sprintf("%s.%d.%s", msgId, timestamp.Unix(), payload)
-
-	h := hmac.New(sha256.New, wh.key)
-	h.Write([]byte(toSign))
-	sig := make([]byte, base64enc.EncodedLen(h.Size()))
-	base64enc.Encode(sig, h.Sum(nil))
-
-	return "v1", sig, nil
-}
-
 func parseTimestampHeader(timestampHeader string) (time.Time, error) {
 	timeInt, err := strconv.ParseInt(timestampHeader, 10, 64)
 	if err != nil {
@@ -143,6 +183,30 @@ func parseTimestampHeader(timestampHeader string) (time.Time, error) {
 	}
 	timestamp := time.Unix(timeInt, 0)
 	return timestamp, nil
+}
+
+func (wh *Webhook) sign(msgId string, timestamp time.Time, payload []byte) (version string, signature []byte, err error) {
+	toSign := fmt.Sprintf("%s.%d.%s", msgId, timestamp.Unix(), string(payload))
+	switch wh.method {
+	case HMAC:
+		h := hmac.New(sha256.New, wh.key)
+		h.Write([]byte(toSign))
+		sig := h.Sum(nil)
+		base64Sig := make([]byte, base64enc.EncodedLen(len(sig)))
+		base64enc.Encode(base64Sig, sig)
+		return "v1", base64Sig, nil
+	case ED25519:
+		if wh.options == nil || wh.options.keyObject.keyObjectType != "private" {
+			return "", nil, fmt.Errorf("invalid key configuration for asymmetric signing")
+		}
+		privKey := ed25519.PrivateKey(wh.options.keyObject.key)
+		sig := ed25519.Sign(privKey, []byte(toSign))
+		base64Sig := make([]byte, base64enc.EncodedLen(len(sig)))
+		base64enc.Encode(base64Sig, sig)
+		return "v1a", base64Sig, nil
+	default:
+		return "", nil, fmt.Errorf("unsupported signing method")
+	}
 }
 
 func verifyTimestamp(timestamp time.Time) error {
