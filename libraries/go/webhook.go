@@ -137,10 +137,8 @@ func (wh *Webhook) verify(payload []byte, headers http.Header, enforceTolerance 
 			continue
 		}
 		version := sigParts[0]
-		if version != "v1" {
-			continue
-		}
 		signature := []byte(sigParts[1])
+
 		switch version {
 		case "v1":
 			if wh.method != HMAC {
