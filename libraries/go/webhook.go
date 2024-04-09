@@ -27,9 +27,9 @@ const (
 	webhookSecretPrefix     string        = "whsec_"
 	webhookPublicKeyPrefix  string        = "whpk_"
 	webhookPrivateKeyPrefix string        = "whsk_"
-	secretKeyType           KeyType       = "secret"
-	publicKeyType           KeyType       = "public"
-	privateKeyType          KeyType       = "private"
+	SecretKeyType           KeyType       = "secret"
+	PublicKeyType           KeyType       = "public"
+	PrivateKeyType          KeyType       = "private"
 	HMAC                    WebhookMethod = "hmac"
 	ED25519                 WebhookMethod = "ed25519"
 )
@@ -53,12 +53,12 @@ type Webhook struct {
 }
 
 type WebhookOptions struct {
-	keyObject KeyObject
+	KeyObject KeyObject
 }
 
 type KeyObject struct {
-	keyObjectType KeyType
-	key           []byte
+	KeyObjectType KeyType
+	Key           []byte
 }
 
 func NewWebhook(secret string) (*Webhook, error) {
@@ -68,8 +68,8 @@ func NewWebhook(secret string) (*Webhook, error) {
 	}
 	return NewWebhookWithOptions(HMAC, &WebhookOptions{
 		KeyObject{
-			keyObjectType: "secret",
-			key:           key,
+			KeyObjectType: SecretKeyType,
+			Key:           key,
 		},
 	})
 }
@@ -81,9 +81,11 @@ func NewWebhookRaw(secret []byte) (*Webhook, error) {
 }
 
 func NewWebhookWithOptions(method WebhookMethod, options *WebhookOptions) (*Webhook, error) {
+	if options.KeyObject.Key == nil {
+		return nil, fmt.Errorf("KeyObject and key are required to initialize a webhook")
+	}
 	return &Webhook{
-		// TODO: Check that the keyObject indeed exists, else return an error
-		key:     options.keyObject.key,
+		key:     options.KeyObject.Key,
 		method:  method,
 		options: options,
 	}, nil
@@ -153,13 +155,14 @@ func (wh *Webhook) verify(payload []byte, headers http.Header, enforceTolerance 
 			if hmac.Equal(signature, expectedSignature) {
 				return nil
 			}
-		case "v1a": // Ed25519 verification
-			if wh.method != ED25519 || wh.options == nil || wh.options.keyObject.keyObjectType != "public" {
+		case "v1a":
+			return fmt.Errorf("this is verify payload: %v", signature)
+			if wh.method != ED25519 || wh.options == nil || wh.options.KeyObject.KeyObjectType != "public" {
 				continue
 			}
 			toSign := fmt.Sprintf("%s.%d.%s", msgId, timestamp.Unix(), string(payload))
 
-			pubKey := ed25519.PublicKey(wh.options.keyObject.key)
+			pubKey := ed25519.PublicKey(wh.options.KeyObject.Key)
 			if ed25519.Verify(pubKey, []byte(toSign), signature) {
 				return nil
 			}
@@ -194,10 +197,10 @@ func (wh *Webhook) sign(msgId string, timestamp time.Time, payload []byte) (vers
 		base64enc.Encode(base64Sig, sig)
 		return "v1", base64Sig, nil
 	case ED25519:
-		if wh.options == nil || wh.options.keyObject.keyObjectType != "private" {
+		if wh.options == nil || wh.options.KeyObject.KeyObjectType != PrivateKeyType {
 			return "", nil, fmt.Errorf("invalid key configuration for asymmetric signing")
 		}
-		privKey := ed25519.PrivateKey(wh.options.keyObject.key)
+		privKey := ed25519.PrivateKey(wh.options.KeyObject.Key)
 		sig := ed25519.Sign(privKey, []byte(toSign))
 		base64Sig := make([]byte, base64enc.EncodedLen(len(sig)))
 		base64enc.Encode(base64Sig, sig)
